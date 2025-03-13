@@ -194,7 +194,7 @@ func (device *Device) handleCorplinkOperation(k, v string) (bool, error) {
 		}
 		err = corplink.AddInterfaceRoute(name, v)
 		if err != nil {
-			return false, ipcErrorf(ipc.IpcErrorUnknown, "failed to set addr to %s for %s: %s", v, name, err)
+			return false, ipcErrorf(ipc.IpcErrorUnknown, "failed to set route to %s for %s: %s", v, name, err)
 		}
 	default:
 		return false, nil
