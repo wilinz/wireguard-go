@@ -100,7 +100,7 @@ func SetInterfaceAddress(name, addr string) error {
 			},
 		}
 	} else {
-		// TODO: it should be implemented with ioctl, but I am lazy
+		// TODO(ManiaciaChao): implement with ioctl
 		interfaceIPv6 = ip
 		cmd := exec.Command("ifconfig", name, "inet6", addr)
 		err = cmd.Run()
@@ -142,7 +142,6 @@ func AddInterfaceRoute(name, network string) error {
 		ifIP.String(),
 	}
 	// TODO: replace with native implement like the others
-	// reply from some random guy: I just feel like this is the best way to do it.
 	if output, err := exec.Command("route", args...).CombinedOutput(); err != nil {
 		return fmt.Errorf("failed to add route: %v (output: %s)", err, output)
 	}
