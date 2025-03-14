@@ -1,7 +1,7 @@
 package corplink
 
 import (
-	"errors"
+	"fmt"
 	"net"
 	"os/exec"
 	"reflect"
@@ -12,6 +12,7 @@ import (
 
 var ioctlFD int
 var interfaceIP net.IP
+var interfaceIPv6 net.IP
 
 func loadFD() (err error) {
 	if ioctlFD != 0 {
@@ -82,12 +83,12 @@ func SetInterfaceAddress(name, addr string) error {
 	if err != nil {
 		return err
 	}
-	interfaceIP = ip
 	devName := devName(name)
 
 	// set addr
 	var req IfAliasReq
 	if len(ip.To4()) == net.IPv4len {
+		interfaceIP = ip
 		var realIP [4]byte
 		copy(realIP[:], ip.To4())
 		req = IfAliasReq{
@@ -99,7 +100,14 @@ func SetInterfaceAddress(name, addr string) error {
 			},
 		}
 	} else {
-		return errors.New("not support ipv6 for now")
+		// TODO(ManiaciaChao): implement with ioctl
+		interfaceIPv6 = ip
+		cmd := exec.Command("ifconfig", name, "inet6", addr)
+		err = cmd.Run()
+		if err != nil {
+			return fmt.Errorf("failed to set IPv6 address: %v", err)
+		}
+		return nil
 	}
 	err = unix.IoctlSetInt(ioctlFD, unix.SIOCSIFADDR, toInt(&req))
 	if err != nil {
@@ -115,7 +123,27 @@ func toInt(data any) int {
 }
 
 func AddInterfaceRoute(name, network string) error {
+	ip, _, err := net.ParseCIDR(network)
+	if err != nil {
+		return fmt.Errorf("failed to parse network CIDR %q: %v", network, err)
+	}
+
+	isIPv4 := ip.To4() != nil
+	ifIP := interfaceIPv6
+	if isIPv4 {
+		ifIP = interfaceIP
+	}
+
+	args := []string{
+		"add",
+		fmt.Sprintf("-inet%s", map[bool]string{true: "", false: "6"}[isIPv4]),
+		"-net",
+		network,
+		ifIP.String(),
+	}
 	// TODO: replace with native implement like the others
-	cmd := exec.Command("route", "add", "-net", network, interfaceIP.String())
-	return cmd.Run()
+	if output, err := exec.Command("route", args...).CombinedOutput(); err != nil {
+		return fmt.Errorf("failed to add route: %v (output: %s)", err, output)
+	}
+	return nil
 }
