@@ -17,12 +17,14 @@ import (
 	"fmt"
 	// "net/http"
 	// _ "net/http/pprof"
+	"net/netip"
 	"strings"
 
 	"golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/device"
 	"golang.zx2c4.com/wireguard/ipc"
 	"golang.zx2c4.com/wireguard/tun"
+	"golang.zx2c4.com/wireguard/tun/netstack"
 )
 
 const (
@@ -31,6 +33,10 @@ const (
 )
 
 var wgDevice *device.Device
+
+// tnet is the userspace network stack used in netstack (SOCKS5) mode.
+// It is nil when running in the normal kernel-TUN mode.
+var tnet *netstack.Net
 
 //export uapi
 func uapi(cmdStr *C.cchar_t) *C.char {
@@ -127,6 +133,104 @@ func startWg(logLevel, protocol C.int, interfaceName *C.cchar_t) C.int {
 	logger.Verbosef("Device %s started", name)
 	ret := upDeviceForWindows(wgDevice)
 	return C.int(ret)
+}
+
+// parseAddrList parses a comma-separated list of IPs or CIDRs (e.g.
+// "100.64.0.2/19,fd00::2/128") into a slice of netip.Addr, dropping any
+// prefix length. Empty entries are skipped.
+func parseAddrList(s string) ([]netip.Addr, error) {
+	var addrs []netip.Addr
+	for _, part := range strings.Split(s, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if strings.Contains(part, "/") {
+			prefix, err := netip.ParsePrefix(part)
+			if err != nil {
+				return nil, fmt.Errorf("invalid CIDR %q: %w", part, err)
+			}
+			addrs = append(addrs, prefix.Addr())
+		} else {
+			addr, err := netip.ParseAddr(part)
+			if err != nil {
+				return nil, fmt.Errorf("invalid IP %q: %w", part, err)
+			}
+			addrs = append(addrs, addr)
+		}
+	}
+	return addrs, nil
+}
+
+// startWgNetstack brings up WireGuard entirely in userspace using gVisor's
+// netstack (no kernel TUN device, no system routes, no root) and exposes a
+// SOCKS5 proxy. Outbound connections accepted by the proxy are dialed through
+// the tunnel via tnet.DialContext.
+//
+//	protocol:    0 for udp (default), 1 for tcp
+//	addresses:   comma-separated interface IPs/CIDRs assigned by the server
+//	dnsServers:  comma-separated DNS server IPs (resolved inside the tunnel)
+//	socksListen: listen address for the SOCKS5 proxy, e.g. "0.0.0.0:1080"
+//	socksUser:   SOCKS5 username; empty disables authentication
+//	socksPass:   SOCKS5 password (used only when socksUser is non-empty)
+//	mtu:         interface MTU (<=0 uses the default)
+//
+//export startWgNetstack
+func startWgNetstack(logLevel, protocol C.int, addresses, dnsServers, socksListen, socksUser, socksPass *C.cchar_t, mtu C.int) C.int {
+	logger = device.NewLogger(int(logLevel), "wg-corplink(netstack) ")
+	logger.Verbosef("Starting wg-corplink version %s (netstack/socks5 mode)", Version)
+
+	addrs, err := parseAddrList(C.GoString(addresses))
+	if err != nil {
+		logger.Errorf("Failed to parse interface addresses: %v", err)
+		return ExitSetupFailed
+	}
+	if len(addrs) == 0 {
+		logger.Errorf("No interface address provided for netstack mode")
+		return ExitSetupFailed
+	}
+	dns, err := parseAddrList(C.GoString(dnsServers))
+	if err != nil {
+		logger.Errorf("Failed to parse dns servers: %v", err)
+		return ExitSetupFailed
+	}
+
+	m := int(mtu)
+	if m <= 0 {
+		m = device.DefaultMTU
+	}
+
+	tunDevice, netStack, err := netstack.CreateNetTUN(addrs, dns, m)
+	if err != nil {
+		logger.Errorf("Failed to create netstack TUN device: %v", err)
+		return ExitSetupFailed
+	}
+	tnet = netStack
+
+	switch protocol {
+	case 0:
+		wgDevice = device.NewDevice(tunDevice, conn.NewDefaultBind(), logger)
+	case 1:
+		wgDevice = device.NewDevice(tunDevice, conn.NewTCPBind(), logger)
+	default:
+		logger.Errorf("Protocol %d not supported", protocol)
+		return ExitSetupFailed
+	}
+
+	if err := wgDevice.Up(); err != nil {
+		logger.Errorf("Failed to bring up netstack device: %v", err)
+		return ExitSetupFailed
+	}
+
+	listen := C.GoString(socksListen)
+	user := C.GoString(socksUser)
+	pass := C.GoString(socksPass)
+	if err := startSocks5(listen, user, pass, netStack, logger); err != nil {
+		logger.Errorf("Failed to start socks5 proxy on %s: %v", listen, err)
+		return ExitSetupFailed
+	}
+	logger.Verbosef("socks5 proxy listening on %s", listen)
+	return ExitSetupSuccess
 }
 
 func main() {
